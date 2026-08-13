@@ -75,8 +75,9 @@ def rule(title: str = "") -> None:
 # ------------------------------------------------------------------- event rendering
 
 
-async def render_events(session: DiagnosticSession) -> None:
-    queue = session.events.subscribe()
+async def render_events(queue: asyncio.Queue) -> None:
+    """Render events as they arrive. The queue is subscribed by the caller, before the
+    session starts, so nothing emitted during startup is missed."""
     try:
         while True:
             event = await queue.get()
@@ -85,8 +86,23 @@ async def render_events(session: DiagnosticSession) -> None:
             _render(event.kind, event.payload)
     except asyncio.CancelledError:  # pragma: no cover - shutdown path
         pass
-    finally:
-        session.events.unsubscribe(queue)
+
+
+def drain_events(queue: asyncio.Queue) -> None:
+    """Render whatever is still queued.
+
+    The renderer only gets scheduled when the session awaits something real. A fast local
+    transport can finish a stretch of work without ever yielding, which would otherwise
+    leave the operator staring at a report whose derivation never printed.
+    """
+    while True:
+        try:
+            event = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return
+        if event is None:
+            return
+        _render(event.kind, event.payload)
 
 
 def _render(kind: str, p: dict[str, Any]) -> None:
@@ -137,8 +153,12 @@ async def _ask(prompt: str) -> str:
     return (await asyncio.to_thread(input, prompt)).strip()
 
 
-def make_approval_handler(approver: str) -> Any:
+def make_approval_handler(approver: str, queue: asyncio.Queue | None = None) -> Any:
     async def handler(remediation: Remediation, plan: SnapshotPlan) -> ApprovalDecision:
+        # Show what led here before asking about it. The operator is being asked to judge
+        # a change against evidence, so the evidence has to be on screen first.
+        if queue is not None:
+            drain_events(queue)
         rule("APPROVAL REQUIRED")
         print(f"  {bold('command')}      {bold(remediation.command)}")
         print(f"  {'rationale':<12} {remediation.rationale}")
@@ -187,8 +207,10 @@ def make_approval_handler(approver: str) -> Any:
     return handler
 
 
-def make_observation_provider() -> Any:
+def make_observation_provider(queue: asyncio.Queue | None = None) -> Any:
     async def provider(instruction: str, expects: ObservationKind) -> Observation:
+        if queue is not None:
+            drain_events(queue)
         rule("OBSERVATION REQUESTED")
         print(f"  {instruction}")
         print(dim(f"  (expects: {expects.value})"))
@@ -212,10 +234,7 @@ def make_observation_provider() -> Any:
 def build_transport(args: argparse.Namespace, capability: Capability) -> Transport:
     if args.mock:
         return faulty_workstation(
-            capability=capability,
-            dry_run=args.dry_run,
-            timeout_s=args.timeout,
-            observation_provider=make_observation_provider(),
+            capability=capability, dry_run=args.dry_run, timeout_s=args.timeout
         )
 
     from ..transports.ssh import SSHTransport
@@ -238,7 +257,6 @@ def build_transport(args: argparse.Namespace, capability: Capability) -> Transpo
         capability=capability,
         dry_run=args.dry_run,
         timeout_s=args.timeout,
-        observation_provider=make_observation_provider(),
     )
 
 
@@ -281,11 +299,16 @@ async def cmd_run(args: argparse.Namespace) -> int:
             statement=authorization, asserted_by=args.approver or getpass.getuser()
         ),
         capability=capability,
-        approval_handler=make_approval_handler(args.approver or getpass.getuser()),
         max_turns=args.max_turns,
     )
 
-    renderer = asyncio.create_task(render_events(session))
+    # Subscribe before anything can emit, so the startup line is not lost. The queue is
+    # then handed to the prompts so they can flush the backlog before asking anything.
+    queue = session.events.subscribe()
+    approver = args.approver or getpass.getuser()
+    session.approval_handler = make_approval_handler(approver, queue)
+    transport.observation_provider = make_observation_provider(queue)
+    renderer = asyncio.create_task(render_events(queue))
     try:
         await session.start()
         report = await session.run(args.instruction)
@@ -295,6 +318,8 @@ async def cmd_run(args: argparse.Namespace) -> int:
     finally:
         await session.close()
         renderer.cancel()
+        drain_events(queue)
+        session.events.unsubscribe(queue)
 
     if report is not None:
         _print_report(session, report)
