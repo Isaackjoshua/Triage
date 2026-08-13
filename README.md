@@ -89,7 +89,7 @@ not own or administer.
 
 ```
 triage/
-  core/         session, capability, gate, journal, models, events
+  core/         session, capability, gate, journal, models, events, authorization
   transports/   base, ssh, mock  (seams for liveusb, human, oob, winrm)
   agent/        tool schema + dispatch, system prompt, command catalog
   remediation/  approval queue + write authorization, snapshot/rollback
@@ -97,3 +97,64 @@ triage/
   cli/          MVP client with inline approvals
 tests/
 ```
+
+[`ARCHITECTURE.md`](ARCHITECTURE.md) covers how the pieces fit and where the seams are for
+the roadmap tiers that are not built yet.
+
+## The command catalog
+
+The read surface is data, not code — `triage/agent/catalog.json`, one entry per binary,
+resolved most-restrictive-first. `triage catalog` prints it. Extending it is a JSON edit:
+
+```sh
+TRIAGE_CATALOG=./my-extra-commands.json triage run --mock
+```
+
+Entries there override built-ins of the same name and add new ones. The same file is what
+generates the read-surface section of the agent's system prompt, so what the model believes
+it can run and what the gate will permit stay the same list.
+
+## Tests
+
+```sh
+.venv/bin/python -m pytest
+```
+
+The Section 9 acceptance criteria are the test plan — `tests/test_acceptance.py` maps one
+test to each, driving the real loop (real gate, journal, approval queue, snapshot ladder)
+against `MockTransport` with a scripted model:
+
+- [x] Session created with an authorization assertion, journaled at creation
+- [x] Read diagnostics produce structured findings separated by category
+- [x] A software-fixable issue produces an exact remediation with rationale, expected
+      effect, and rollback plan; it blocks on human approval; on approval the system
+      snapshots, applies, then verifies, and the outcome is fed back to the agent
+- [x] A `WRITE`/`UNKNOWN` command routed through `run_read_command` is refused and steered
+      to `propose_remediation`
+- [x] The full session is reconstructable from the append-only journal; credentials never
+      appear in it
+- [x] The entire flow runs under `--dry-run` and against `MockTransport` with no real target
+- [x] No code path applies a mutating command without an approved `Remediation`
+
+## Model configuration
+
+The agent loop runs on the Anthropic Messages API with adaptive thinking. Configurable by
+environment:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `TRIAGE_MODEL` | `claude-opus-5` | Model id |
+| `TRIAGE_EFFORT` | `high` | Reasoning effort: `low`…`max` |
+| `TRIAGE_MAX_TOKENS` | `16000` | Output cap per turn |
+| `TRIAGE_MAX_TURNS` | `40` | Turn budget before the session stops |
+| `TRIAGE_CATALOG` | — | Extra catalog file layered over the built-in |
+
+## Service
+
+```sh
+uvicorn triage.api.app:app --reload
+```
+
+Approvals happen out of band: the pending change appears on the SSE stream and at
+`GET /sessions/{id}/remediations`, the session stays paused, and it resumes when a decision
+is POSTed. Interactive docs at `/docs`.
