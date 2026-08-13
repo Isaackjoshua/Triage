@@ -61,9 +61,15 @@ class MockTransport(Transport):
         capability: Capability = Capability.EXECUTE_RW,
         **kwargs: object,
     ) -> None:
+        snapshot_capable = bool(kwargs.pop("snapshot_capable", True))
+        filesystem_type = str(kwargs.pop("filesystem_type", "ext4"))
         super().__init__(target=target, capability=capability, **kwargs)  # type: ignore[arg-type]
         self.script = script or []
         self.state: set[str] = set()
+        #: Set False to rehearse the "no rollback point available" branch of approval.
+        self.snapshot_capable = snapshot_capable
+        #: "btrfs"/"zfs" put the mock on the snapshot rung of the ladder instead.
+        self.filesystem_type = filesystem_type
         #: Every command the mock was asked to run, for assertions in tests.
         self.executed: list[str] = []
 
@@ -101,12 +107,33 @@ class MockTransport(Transport):
     async def snapshot(self, scope: str) -> SnapshotRef | None:
         if self.dry_run:
             return await super().snapshot(scope)
+        if not self.snapshot_capable:
+            return None
         return SnapshotRef(
             kind=SnapshotKind.BTRFS,
             scope=scope,
             rollback_hint=f"btrfs subvolume snapshot restore (mock) for {scope}",
             detail="Mock snapshot — no data was actually captured.",
         )
+
+    async def backup_files(self, paths: list[str]) -> SnapshotRef | None:
+        """The file-backup rung of the snapshot ladder, so the mock is honest about it."""
+        if not paths:
+            return None
+        if self.dry_run:
+            return await super().snapshot(", ".join(paths))
+        if not self.snapshot_capable:
+            return None
+        return SnapshotRef(
+            kind=SnapshotKind.FILE_BACKUP,
+            scope=", ".join(paths),
+            rollback_hint=f"cp -a /var/backups/triage/<id>/<path> <path> (mock) for {paths}",
+            detail="Mock file backup — no data was actually copied.",
+        )
+
+    async def _filesystem_type(self, path: str) -> str:
+        """The mock's /var is plain ext4, so the snapshot ladder falls to file backup."""
+        return self.filesystem_type
 
 
 # ---------------------------------------------------------------------------------------
