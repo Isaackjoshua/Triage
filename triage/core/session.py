@@ -296,6 +296,44 @@ class DiagnosticSession:
         # Snapshot before mutate. This runs after approval and immediately before the write.
         snapshot = await self.snapshots.protect(remediation, plan)
 
+        # The plan is a forecast, and forecasts are wrong sometimes: a promised btrfs
+        # snapshot or file backup can fail to materialise. The human approved on the
+        # strength of that promise, so go back and ask again with the truth rather than
+        # either proceeding unprotected or rejecting on their behalf.
+        if (
+            snapshot is not None
+            and plan.has_rollback
+            and not snapshot.is_rollback_possible
+            and not decision.acknowledge_no_rollback
+        ):
+            plan = SnapshotPlan(
+                snapshot.kind,
+                scope=snapshot.scope,
+                detail=f"the planned {plan.kind.value} rollback point could not be created",
+                paths=plan.paths,
+            )
+            self.events.emit(
+                "approval_requested",
+                remediation=serialize(remediation),
+                snapshot_plan=plan.describe(),
+                rollback_available=False,
+                reason="the planned rollback point could not be created",
+            )
+            decision = await self.approval_handler(remediation, plan)
+            if not decision.approved:
+                self.approvals.reject(remediation.id, decision.approver, decision.reason)
+                self.events.emit(
+                    "remediation_rejected",
+                    remediation_id=remediation.id,
+                    reason=decision.reason,
+                )
+                return (
+                    f"REMEDIATION {remediation.id} was NOT applied: the rollback point it was "
+                    f"approved against could not be created, and it was not re-approved "
+                    f"without one. The machine is unchanged.\n"
+                    f"  reason: {decision.reason or '(none given)'}"
+                )
+
         try:
             authorization: WriteAuthorization = self.approvals.approve(
                 remediation.id,

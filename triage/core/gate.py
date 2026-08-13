@@ -253,7 +253,8 @@ class CommandGate:
                 return verdict(
                     entry.classification,
                     f"'{entry.name} {positionals[0]}' is not a catalogued read-only "
-                    f"subcommand of {entry.name}.",
+                    f"subcommand of {entry.name}, so it is treated as a change to the "
+                    "machine. Route it through propose_remediation.",
                     f"{entry.name} {positionals[0]}",
                 )
 
